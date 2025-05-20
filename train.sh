@@ -1,6 +1,6 @@
-MODEL_NAME="/home/aiscuser/ads_yc/rlaif/mistral-ckpt/checkpoint-4000"
-TOKENIZER_NAME="/home/aiscuser/ads_yc/rlaif/mistral-ckpt/checkpoint-4000"
-REWARD_MODEL_NAME="/home/aiscuser/superw/token_codes/rm/ckpt/superw_l5g5/checkpoint-700"
+MODEL_NAME="mistral-ckpt/checkpoint-4000"
+TOKENIZER_NAME="mistral-ckpt/checkpoint-4000"
+REWARD_MODEL_NAME="rm/ckpt/superw_l5g5/checkpoint-700"
 LOG_WITH="wandb"
 LEARNING_RATE=5e-6
 LR_SCHEDULER_TYPE="linear"
@@ -23,7 +23,7 @@ INIT_KL_COEF=0.2
 ADAP_KL_CTRL=true
 LOCAL_RANK=0
 PROJECT_NAME="superw_token_ppo"
-DATA_FILE_PATH="/home/aiscuser/superw/token_codes/datasets/ppo/train_20k.json"
+DATA_FILE_PATH="datasets/ppo/train_20k.json"
 TRACKER_KWARGS="{\"wandb\": {\"entity\": \"morning77\", \"name\": \"l5g5_700_debug\"}}"
 
 accelerate launch --main_process_port 26666 --multi_gpu --num_machines 1  --num_processes 8 train_token_ppo.py \
