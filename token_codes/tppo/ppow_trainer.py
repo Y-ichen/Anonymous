@@ -805,7 +805,7 @@ class PPOWTrainer(BaseTrainer):
         
         scores = self.rematch_scores(scores, words, all_tokens)
         
-        # TODO: add length penalty
+        # add length penalty
         alpha = 2
         
         # get suggest length

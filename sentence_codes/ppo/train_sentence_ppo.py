@@ -12,10 +12,12 @@ from trl import AutoModelForCausalLMWithValueHead, PPOConfig, PPOTrainer, set_se
 from trl.core import LengthSampler
 from transformers import get_scheduler
 
-from ppow_trainer import PPOWTrainer
-
 import wandb 
 import re
+from peft import PeftModel, PeftConfig
+
+from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM
+
 import os
 import tyro
 import json
@@ -29,12 +31,12 @@ class ScriptArguments:
     """
     The name of the Casual LM model we wish to fine with PPO
     """
-    model_name: Optional[str] = field(default="/home/aiscuser/ads_yc/rlaif/mistral-ckpt/checkpoint-4000", metadata={"help": "the model name"})
-    tokenizer_name: Optional[str] = field(default="/home/aiscuser/ads_yc/rlaif/mistral-ckpt/checkpoint-4000", metadata={"help": "the tokenizer name"})
-    reward_model_name: Optional[str] = field(default="/home/aiscuser/ads_yc/rlaif/token-rm-ckpt/checkpoint-260", metadata={"help": "the reward model name"})
+    model_name: Optional[str] = field(default="mistral-ckpt/checkpoint-4000", metadata={"help": "the model name"})
+    tokenizer_name: Optional[str] = field(default="mistral-ckpt/checkpoint-4000", metadata={"help": "the tokenizer name"})
+    reward_model_name: Optional[str] = field(default="sentence-rm-ckpt/checkpoint-200/", metadata={"help": "the reward model name"})
     
     log_with: Optional[str] = field(default='wandb', metadata={"help": "use 'wandb' to log with wandb"})
-    learning_rate: Optional[float] = field(default=1e-5, metadata={"help": "the learning rate"})
+    learning_rate: Optional[float] = field(default=5e-6, metadata={"help": "the learning rate"})
     lr_scheduler_type: Optional[str] = field(default="linear", metadata={"help": "the learning rate scheduler type"})
     output_max_length: Optional[int] = field(default=400, metadata={"help": "maximum length for generation"})
     mini_batch_size: Optional[int] = field(default=1, metadata={"help": "the PPO minibatch size"})
@@ -52,11 +54,10 @@ class ScriptArguments:
     )
     batched_gen: Optional[bool] = field(default=True, metadata={"help": "whether to use the batched text gen"})
     save_freq: Optional[int] = field(default=5, metadata={"help": "n steps to save the model"})
-    output_dir: Optional[str] = field(default="ckpt/superw_token_ppo", metadata={"help": "n steps to save the model"})
+    output_dir: Optional[str] = field(default="ckpt/sentence_ppo", metadata={"help": "n steps to save the model"})
     seed: Optional[int] = field(default=42, metadata={"help": "the seed"})
-    
     train_epochs: Optional[int] = field(default=2, metadata={"help": "number of epochs"})
-    steps: Optional[int] = field(default=1200, metadata={"help": "number of epochs"})
+    steps: Optional[int] = field(default=1200, metadata={"help": "number of steps"})
     init_kl_coef: Optional[float] = field(
         default=0.2,
         metadata={"help": "Initial KL penalty coefficient (used for adaptive and linear control)"},
@@ -64,10 +65,11 @@ class ScriptArguments:
 
     adap_kl_ctrl: Optional[bool] = field(default=True, metadata={"help": "Use adaptive KL control, otherwise linear"})
     local_rank: Optional[int] = field(default=0, metadata={"help": "local rank"})
-
-    project_name: Optional[str] = field(default="superw_token_ppo", metadata={"help": "wandb project name"})
-    data_file_path: Optional[str] = field(default="/home/aiscuser/superw/token_codes/datasets/ppo/train_20k.json", metadata={"help": "data file path"})
+    
+    project_name: Optional[str] = field(default="sentence_ppo", metadata={"help": "wandb project name"})
+    data_file_path: Optional[str] = field(default="datasets/ppo/train_20k.json", metadata={"help": "data file path"})
     tracker_kwargs: Optional[str] = field(default=None, metadata={"help": "tracker kwargs of wandb"})
+
 
 parser = HfArgumentParser(ScriptArguments)
 script_args: ScriptArguments = parser.parse_args_into_dataclasses()[0]
@@ -77,11 +79,11 @@ if script_args.tracker_kwargs:
     tracker_kwargs_dict = json.loads(script_args.tracker_kwargs)
 else:
     tracker_kwargs_dict = {}
+    
+reward_model_name = script_args.reward_model_name
 
 if not os.path.exists(script_args.output_dir):
     os.makedirs(script_args.output_dir)
-
-reward_model_name = script_args.reward_model_name
 
 config = PPOConfig(
     steps=script_args.steps,
@@ -102,15 +104,14 @@ config = PPOConfig(
     tracker_project_name=script_args.project_name,
 )
 
-# wandb.init(project="ppo", name="yc1")
-
+# train_dataset = load_dataset("/home/aiscuser/ads_yc/rlaif/dataset", data_dir="ppo", split="train")
 train_dataset = load_dataset("json", data_files=script_args.data_file_path, split="train")
 
 sent_kwargs = {
-    # "top_k": None,
-    # "function_to_apply": "none",
+    "top_k": None,
+    "function_to_apply": "none",
     "batch_size": script_args.batch_size,
-    # "truncation": True,
+    "truncation": True,
 }
 
 tokenizer = AutoTokenizer.from_pretrained(
@@ -128,10 +129,6 @@ def filter_query_num_10(example):
 def filter_non_english_answer(example):
     english_pattern = re.compile(r'^[a-zA-Z0-9\s\.,\?!]+$')
     return all(bool(english_pattern.match(ans.strip())) for ans in example['answer'].split(','))
-
-# def filter_query_with_brackets(example):
-#     bracket_pattern = re.compile(r'(\[\].*?){1,}')
-#     return not bool(bracket_pattern.search(example['query']))
 
 def build_dataset(ds, tokenizer):
     original_columns = ds.column_names
@@ -163,8 +160,8 @@ def build_dataset(ds, tokenizer):
         remove_columns=original_columns,
     )
     print("unfiltered len:", len(ds))
-    ds = ds.filter(lambda x: len(x["input_ids"]) < 1500, batched=False)
-    print("filtered len by 1500:", len(ds))
+    ds = ds.filter(lambda x: len(x["input_ids"]) < 2000, batched=False)
+    print("filtered len by 2000:", len(ds))
     ds = ds.filter(filter_query_num_10)
     print("filtered len by == 10:", len(ds))
     
@@ -172,44 +169,24 @@ def build_dataset(ds, tokenizer):
     ds = ds.filter(filter_non_english_answer)
     print("filtered len by english answer:", len(ds))
     
-    # # 过滤掉query字段中存在[]的数据
-    # ds = ds.filter(filter_query_with_brackets)
-    # print("filtered len by query with three brackets:", len(ds))
-
     ds.set_format(type="torch")
     return ds
 
 # We retrieve the dataloader by calling the `build_dataset` function.
 dataset = build_dataset(train_dataset, tokenizer)
+# dataset = dataset.select(range(20000))
 print("Dataset length:", len(dataset))
-
-import json
-# 将数据集保存为json文件
-output_file = "ppo_train_data.json"
-with open(output_file, "w") as f:
-    for example in dataset:
-        # 将每个样本转换为字典格式
-        example_dict = {
-            "sentence1": example["query"],
-            # "input_ids": example["input_ids"].tolist(),
-            # "query_nums": example["query_nums"],
-            "sentence2": example["answer"]
-        }
-        # 将字典转换为JSON字符串并写入文件
-        json_str = json.dumps(example_dict, ensure_ascii=False)
-        f.write(json_str + "\n")
-
-print(f"Dataset saved to {output_file}")
 
 def collator(data):
     return dict((key, [d[key] for d in data]) for key in data[0])
-
 
 # set seed before initializing value head for deterministic eval
 set_seed(config.seed)
 
 # Now let's build the model, the reference model, and the tokenizer.
 current_device = Accelerator().local_process_index
+
+
 
 lora_config = LoraConfig(
     r=16,
@@ -218,19 +195,15 @@ lora_config = LoraConfig(
     bias="none",
     task_type="CAUSAL_LM",
 )
+
 model = AutoModelForCausalLMWithValueHead.from_pretrained(
-    config.model_name,
-    # load_in_8bit=True,
-    # torch_dtype=torch.bfloat16,
-    peft_config=lora_config,
+config.model_name,
+# load_in_8bit=True,
+# torch_dtype=torch.bfloat16,
+peft_config=lora_config,
 )
-
+        
 ref_model = None
-
-# optimizer = Adam(
-#         filter(lambda p: p.requires_grad, model.parameters()),
-#         lr=config.learning_rate,
-# )
 
 # if script_args.adafactor:
 optimizer = Adafactor(
@@ -245,11 +218,11 @@ lr_scheduler = get_scheduler(
     name=script_args.lr_scheduler_type,
     optimizer=optimizer,
     num_warmup_steps=0,
-    num_training_steps=script_args.steps,
-)   
+    num_training_steps=600,
+)
 
 # We then build the PPOTrainer, passing the model, the reference model, the tokenizer
-ppo_trainer = PPOWTrainer(
+ppo_trainer = PPOTrainer(
     config,
     model,
     ref_model=ref_model,
@@ -269,12 +242,12 @@ reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name, padding="max
 reward_tokenizer.pad_token = reward_tokenizer.eos_token
     
 sentiment_pipe = pipeline(
-    "token-classification",
+    "sentiment-analysis",
     model=reward_model_name,
     tokenizer=reward_tokenizer,
     # model_kwargs={"load_in_8bit": True},
     # model_kwargs={"torch_dtype": torch.float16},
-    # return_token_type_ids=False,
+    return_token_type_ids=False,
 )
 
 # We then define the arguments to pass to the `generate` function. These arguments
@@ -286,7 +259,7 @@ generation_kwargs = {
     "top_p": 1.0,
     "do_sample": True,
     "pad_token_id": tokenizer.pad_token_id,
-    "eos_token_id": tokenizer.eos_token_id, # change from 100_000 to 2
+    "eos_token_id": tokenizer.eos_token_id,
 }
 output_min_length = 32
 output_max_length = script_args.output_max_length
@@ -327,9 +300,7 @@ for epoch in range(script_args.train_epochs):
     last_pipeouts = None
     last_question_tensors = None
     last_response_tensors = None
-    for step, batch in tqdm(enumerate(ppo_trainer.dataloader), desc=f"Epoch {epoch+1} "):
-        # if step >= config.steps:
-        #     break
+    for step, batch in tqdm(enumerate(ppo_trainer.dataloader), desc=f"Epoch {epoch} "):
 
         question_tensors = batch["input_ids"]
 
@@ -353,41 +324,33 @@ for epoch in range(script_args.train_epochs):
             last_response_tensors = response_tensors
             last_pipeouts = pipe_outputs
         except:
-            print(f"Error at step {step}")
-            # TODO: save the batch to a file and print the error message
-            # os.makedirs("error_batches", exist_ok=True)
-            # with open(f"error_batches/epoch_{epoch}_batch_{step}.json", "w") as f:
-            #     json.dump(batch, f)
-            question_tensors = last_question_tensors
-            response_tensors = last_response_tensors
-            pipe_outputs = last_pipeouts
+            print(f"Error at step {step} when computing rewards")
             continue
-        
+
         rewards = []
-        words = []
-        
         for output in pipe_outputs:
-            token_rewards = torch.zeros(len(output))
-            token_str = []
+            score_pos = 0
+            score_neg = 0
+            for item in output:
+                if item['label'] == 'LABEL_1':
+                    score_pos = item['score']
+                elif item['label'] == 'LABEL_0':
+                    score_neg = item['score']
+            logits = [score_neg, score_pos]
+
+            logits = torch.tensor(logits)
+            logits = torch.nn.functional.softmax(logits, dim=0)
             
-            for i,item in enumerate(output):
-                
-                label = item['entity']
-                reward = int(label.split('_')[1])
-                token_rewards[i] = reward
-                
-                word = item['word'].strip()
-                token_str.append(word)
-                
-            rewards.append(token_rewards)
-            words.append(token_str)
+            reward = logits[1] - script_args.reward_baseline
+            # reward = (logits[1] - script_args.reward_baseline)*2
+            rewards.append(reward)
 
         try:
-            stats = ppo_trainer.step(question_tensors, response_tensors, rewards, words)
+            stats = ppo_trainer.step(question_tensors, response_tensors, rewards)
             ppo_trainer.log_stats(stats, batch, rewards)
         except:
-            print(f"Error at step {step} when training")
+            print(f"Error at step {step} when stepping")
             continue
 
         if step !=0 and step % 5 == 0:
-            ppo_trainer.save_pretrained(script_args.output_dir + f"epoch_{epoch}_step_{step}")
+            ppo_trainer.save_pretrained(script_args.output_dir + f"epoch_{step}_step_{step}")
